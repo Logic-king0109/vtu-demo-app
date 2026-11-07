@@ -1,0 +1,327 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ENUMS
+// ═══════════════════════════════════════════════════════════
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  BLOCKED
+}
+
+enum TxType {
+  FUNDING
+  DATA
+  AIRTIME
+  CABLE
+  REFUND
+  ADMIN_CREDIT
+  ADMIN_DEBIT
+}
+
+enum TxStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum Network {
+  MTN
+  AIRTEL
+  GLO
+  NINE_MOBILE
+}
+
+enum CableProvider {
+  DSTV
+  GOTV
+  STARTIMES
+}
+
+// ═══════════════════════════════════════════════════════════
+// USER
+// ═══════════════════════════════════════════════════════════
+
+model User {
+  id            String     @id @default(cuid())
+  name          String
+  email         String     @unique
+  phone         String     @unique
+  passwordHash  String
+  pinHash       String
+  pinVersion    Int        @default(1)
+  role          Role       @default(USER)
+  status        UserStatus @default(ACTIVE)
+
+  // PIN brute-force protection
+  pinFailedAttempts Int      @default(0)
+  pinLockedUntil    DateTime?
+
+  // Virtual account (provider-agnostic fields)
+  vaNumber      String?  @unique
+  vaBankName    String?
+  vaAccountName String?
+  vaReference   String?  @unique
+  vaCreatedAt   DateTime?
+
+  wallet        Wallet?
+  transactions  Transaction[]
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]  @relation("AuditActor")
+  passwordResets PasswordReset[]
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([email])
+  @@index([phone])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ═══════════════════════════════════════════════════════════
+// WALLET  (1-to-1 with User)
+// ═══════════════════════════════════════════════════════════
+
+model Wallet {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  balance   Decimal  @default(0) @db.Decimal(18, 2)
+  // Optimistic-lock version for future scale — bumped on every mutation
+  version   Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+// ═══════════════════════════════════════════════════════════
+// TRANSACTION
+// ═══════════════════════════════════════════════════════════
+
+model Transaction {
+  id              String     @id @default(cuid())
+  userId          String
+  user            User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Human-readable reference: VTU-YYYYMMDD-XXXXXXXX
+  reference       String     @unique
+
+  type            TxType
+  status          TxStatus   @default(PENDING)
+
+  // Amounts (Naira, Decimal 18,2)
+  amount          Decimal    @db.Decimal(18, 2)   // what user paid
+  providerCost    Decimal    @db.Decimal(18, 2)   // what provider charged
+  sellingPrice    Decimal    @db.Decimal(18, 2)   // = amount
+  profit          Decimal    @db.Decimal(18, 2)   // sellingPrice - providerCost (0 if failed/refunded)
+
+  // Idempotency (DB source of truth, Redis is a fast-lane)
+  idempotencyKey  String?    @unique
+
+  // Provider routing metadata (NO company names, only A/B/C)
+  providerTried   String?    // "A", "B", "C"
+  providerRef     String?    // provider-side reference
+
+  // Provider product metadata (network, plan, phone)
+  meta            Json?      // { network, planId, phone, smartcard, bouquet, ... }
+
+  // Provider raw response for debugging (trimmed)
+  providerResponse Json?
+
+  // Refund tracking
+  refundedAt      DateTime?
+  refundedBy      String?    // admin userId if manual, null if auto
+  refundReference String?    @unique
+
+  // Failure reason (user-facing short message)
+  failureReason   String?
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([type])
+  @@index([createdAt])
+  @@index([reference])
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+}
+
+// ═══════════════════════════════════════════════════════════
+// REFRESH TOKEN  (hashed, rotated)
+// ═══════════════════════════════════════════════════════════
+
+model RefreshToken {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  userAgent  String?
+  ipAddress  String?
+
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ═══════════════════════════════════════════════════════════
+// PASSWORD RESET (OTP via Resend)
+// ═══════════════════════════════════════════════════════════
+
+model PasswordReset {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  otpHash     String
+  expiresAt   DateTime
+  attempts    Int       @default(0)
+  consumedAt  DateTime?
+  ipAddress   String?
+
+  createdAt   DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ═══════════════════════════════════════════════════════════
+// DATA PLAN  (admin-managed pricing)
+// ═══════════════════════════════════════════════════════════
+
+model DataPlan {
+  id            String   @id @default(cuid())
+  network       Network
+  name          String     // e.g. "MTN 1GB SME"
+  sizeMb        Int        // 1024
+  validityDays  Int        // 30
+
+  // Pricing
+  sellingPrice  Decimal  @db.Decimal(18, 2)
+  providerCost  Decimal  @db.Decimal(18, 2)
+
+  // Provider plan codes — keyed by A/B/C, no company names
+  providerPlanA String?
+  providerPlanB String?
+  providerPlanC String?
+
+  enabled       Boolean  @default(true)
+
+   // for filtering, not FK-bound
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([network, name])
+  @@index([network, enabled])
+  @@index([enabled])
+}
+
+// ═══════════════════════════════════════════════════════════
+// AIRTIME / CABLE PRICING (admin-controlled margins)
+// ═══════════════════════════════════════════════════════════
+
+model ServiceConfig {
+  id          String   @id @default(cuid())
+  key         String   @unique  // "AIRTIME_MTN", "CABLE_DSTV"
+  enabled     Boolean  @default(true)
+  // Percentage margin applied to provider cost (e.g. 5.00 = 5%)
+  marginPct   Decimal  @db.Decimal(5, 2) @default(0)
+  // Optional flat override per network/cable (null = use marginPct)
+  minAmount   Decimal? @db.Decimal(18, 2)
+  maxAmount   Decimal? @db.Decimal(18, 2)
+  // For cables, provider plan codes per bouquet go in CableBouquet table
+  announcement String?
+  updatedAt   DateTime @updatedAt
+
+  @@index([key])
+}
+
+// ═══════════════════════════════════════════════════════════
+// CABLE BOUQUET
+// ═══════════════════════════════════════════════════════════
+
+model CableBouquet {
+  id            String        @id @default(cuid())
+  provider      CableProvider
+  name          String        // e.g. "Compact Plus"
+  sellingPrice  Decimal       @db.Decimal(18, 2)
+  providerCost  Decimal       @db.Decimal(18, 2)
+  providerPlanA String?
+  providerPlanB String?
+  providerPlanC String?
+  enabled       Boolean       @default(true)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([provider, name])
+  @@index([provider, enabled])
+}
+
+// ═══════════════════════════════════════════════════════════
+// WEBHOOK LOG  (for admin visibility + debugging)
+// ═══════════════════════════════════════════════════════════
+
+model WebhookLog {
+  id          String   @id @default(cuid())
+  source      String   // "VA" (virtual account provider)
+  eventType   String?  // provider event name
+  reference   String?  // webhook reference (may be null on malformed)
+  signatureOk Boolean
+  ipAddress   String?
+  rawPayload  Json
+  processed   Boolean  @default(false)
+  error       String?
+  createdAt   DateTime @default(now())
+
+  @@index([reference])
+  @@index([processed])
+  @@index([createdAt])
+}
+
+// ═══════════════════════════════════════════════════════════
+// AUDIT LOG  (admin actions — disputes, compliance)
+// ═══════════════════════════════════════════════════════════
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorId     String
+  actor       User     @relation("AuditActor", fields: [actorId], references: [id])
+  action      String   // "ADMIN_CREDIT", "BLOCK_USER", "PRICE_CHANGE", "REFUND", ...
+  targetType  String?  // "User", "Transaction", "DataPlan"
+  targetId    String?
+  meta        Json?
+  ipAddress   String?
+  createdAt   DateTime @default(now())
+
+  @@index([actorId])
+  @@index([action])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
+
+// ═══════════════════════════════════════════════════════════
+// OTP / RATE LIMIT COUNTERS — stored in Redis, not Postgres.
+// ═══════════════════════════════════════════════════════════
